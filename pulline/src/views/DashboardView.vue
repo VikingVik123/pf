@@ -46,46 +46,60 @@
         </div>
 
         <div v-else class="grid">
-          <router-link
-            v-for="project in projects"
-            :key="project.id"
-            :to="`/projects/${project.id}`"
-            class="card project-card"
-          >
-            <div class="card-top">
-              <span class="status-dot" :class="`status-${project.status}`"></span>
-              <span class="status-label">{{ statusLabel(project.status) }}</span>
-            </div>
-            <h3 class="project-name">{{ project.project_name || project.filename || 'Untitled project' }}</h3>
-            <dl class="project-meta">
-              <div>
-                <dt>Floors</dt>
-                <dd>{{ project.total_floors }}</dd>
+          <div v-for="project in projects" :key="project.id" class="card project-card">
+            <router-link :to="`/projects/${project.id}`" class="project-card-link">
+              <div class="card-top">
+                <span class="status-dot" :class="`status-${project.status}`"></span>
+                <span class="status-label">{{ statusLabel(project.status) }}</span>
               </div>
-              <div>
-                <dt>Elements</dt>
-                <dd>{{ project.total_elements }}</dd>
-              </div>
-            </dl>
-            <p class="project-date">{{ formatDate(project.created_at) }}</p>
-          </router-link>
+              <h3 class="project-name">{{ project.project_name || project.filename || 'Untitled project' }}</h3>
+              <dl class="project-meta">
+                <div>
+                  <dt>Floors</dt>
+                  <dd>{{ project.total_floors }}</dd>
+                </div>
+                <div>
+                  <dt>Elements</dt>
+                  <dd>{{ project.total_elements }}</dd>
+                </div>
+              </dl>
+              <p class="project-date">{{ formatDate(project.created_at) }}</p>
+            </router-link>
 
-          <router-link to="/projects/new" class="card add-card">
+            <button
+              v-if="project.status === 'pending'"
+              type="button"
+              class="process-btn"
+              :disabled="processingIds[project.id]"
+              @click="handleProcess(project)"
+            >
+              {{ processingIds[project.id] ? 'Starting…' : 'Process' }}
+            </button>
+          </div>
+
+          <button type="button" class="card add-card" @click="showNewProjectModal = true">
             <span class="add-icon" aria-hidden="true">+</span>
             <span>New project</span>
-          </router-link>
+          </button>
         </div>
       </main>
     </div>
+
+    <NewProjectModal
+      :open="showNewProjectModal"
+      @close="showNewProjectModal = false"
+      @created="handleProjectCreated"
+    />
   </div>
 </template>
 
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { authApi } from '../api/auth'
 import { ifcApi } from '../api/ifc'
 import { tokenStorage } from '../api/tokenStorage'
+import NewProjectModal from '../components/NewProjectModal.vue'
 
 const router = useRouter()
 
@@ -93,6 +107,8 @@ const user = ref(null)
 const projects = ref([])
 const loadingProjects = ref(true)
 const loadError = ref('')
+const showNewProjectModal = ref(false)
+const processingIds = reactive({})
 
 const userDisplayName = computed(() => user.value?.full_name || user.value?.username || '')
 const userInitial = computed(() => userDisplayName.value ? userDisplayName.value[0].toUpperCase() : '?')
@@ -142,6 +158,25 @@ async function handleLogout() {
   } finally {
     tokenStorage.clear()
     router.push('/login')
+  }
+}
+
+function handleProjectCreated(project) {
+  projects.value = [project, ...projects.value]
+}
+
+async function handleProcess(project) {
+  processingIds[project.id] = true
+  try {
+    const result = await ifcApi.processProject(project.id)
+    const idx = projects.value.findIndex((p) => p.id === project.id)
+    if (idx !== -1) {
+      projects.value[idx] = { ...projects.value[idx], status: result.status }
+    }
+  } catch (err) {
+    loadError.value = 'Could not start processing that project. Please try again.'
+  } finally {
+    delete processingIds[project.id]
   }
 }
 
@@ -352,15 +387,46 @@ h1 {
   display: flex;
   flex-direction: column;
   gap: 12px;
-  text-decoration: none;
-  color: inherit;
-  transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease;
+  padding: 0;
+  overflow: hidden;
 }
 
-.project-card:hover {
-  border-color: #2f6fa8;
-  box-shadow: 0 4px 14px rgba(15, 34, 56, 0.08);
-  transform: translateY(-2px);
+.project-card-link {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 20px;
+  text-decoration: none;
+  color: inherit;
+  flex: 1;
+  transition: background 0.15s ease;
+}
+
+.project-card-link:hover {
+  background: rgba(47, 111, 168, 0.04);
+}
+
+.process-btn {
+  margin: 0 20px 16px;
+  padding: 8px 14px;
+  font-family: 'Space Grotesk', sans-serif;
+  font-weight: 600;
+  font-size: 13px;
+  color: #0e2238;
+  background: transparent;
+  border: 1.5px solid #2f6fa8;
+  border-radius: 3px;
+  cursor: pointer;
+  transition: background 0.15s ease, opacity 0.15s ease;
+}
+
+.process-btn:hover:not(:disabled) {
+  background: rgba(47, 111, 168, 0.08);
+}
+
+.process-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }
 
 .card-top {
@@ -435,6 +501,10 @@ h1 {
   border-color: #c9c2af;
   color: #7a8390;
   text-decoration: none;
+  font-family: inherit;
+  font-size: 14px;
+  cursor: pointer;
+  width: 100%;
   transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
 }
 

@@ -15,10 +15,20 @@ const routes = [
     name: 'login',
     component: () => import('../views/LoginView.vue'),
   },
+  {
+    path: '/forgot-password',
+    name: 'forgot-password',
+    component: () => import('../views/ForgotPasswordView.vue'),
+  },
    {
     path: '/dashboard',
     name: 'dashboard',
     component: () => import('../views/DashboardView.vue'),
+  },
+   {
+    path: '/projects/:id',
+    name: 'project-detail',
+    component: () => import('../views/ProjectDetailView.vue'),
   },
 ]
 
