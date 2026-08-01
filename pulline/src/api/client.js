@@ -1,57 +1,89 @@
 import axios from 'axios'
-import { useAuthStore } from '../stores/auth.js'
+import { tokenStorage } from './tokenStorage'
 
-const resolvedBaseUrl = '/api'
+const baseURL = import.meta.env.VITE_API_BASE_URL
 
-const api = axios.create({
-  baseURL: resolvedBaseUrl,
-  headers: { 'Content-Type': 'application/json' }
+export const apiClient = axios.create({
+  baseURL,
 })
 
-function shouldSkipAuthHeader(url = '') {
-  return ['/auth/login', '/auth/register', '/auth/refresh', '/auth/logout', '/auth/forgot-password', '/auth/reset-password', '/auth/verify-email', '/auth/resend-verification', '/auth/health'].some((path) => url.includes(path))
-}
-
-function shouldSkipRefresh(url = '') {
-  return ['/auth/login', '/auth/register', '/auth/refresh', '/auth/logout', '/auth/forgot-password', '/auth/reset-password', '/auth/verify-email', '/auth/resend-verification', '/auth/health'].some((path) => url.includes(path))
-}
-
-function getAuthToken() {
-  const auth = useAuthStore()
-  const envToken = import.meta.env.VITE_API_BEARER_TOKEN || import.meta.env.VITE_API_TOKEN || ''
-  const storedToken = localStorage.getItem('pulline_dev_bearer_token') || localStorage.getItem('pulline_access_token') || ''
-  return auth.accessToken || storedToken || envToken
-}
-
-api.interceptors.request.use((config) => {
-  if (!shouldSkipAuthHeader(config.url || '')) {
-    const token = getAuthToken()
-    if (token) {
-      config.headers.Authorization = `Bearer ${token}`
-    }
+// Attach the access token to every outgoing request, if we have one.
+apiClient.interceptors.request.use((config) => {
+  const token = tokenStorage.getAccessToken()
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`
   }
   return config
 })
 
-api.interceptors.response.use(
-  (res) => res,
-  async (err) => {
-    const original = err.config
-    if (err.response?.status === 401 && !original._retry && !shouldSkipRefresh(original.url || '')) {
-      original._retry = true
-      const auth = useAuthStore()
-      try {
-        await auth.refresh()
-        original.headers.Authorization = `Bearer ${auth.accessToken}`
-        return api(original)
-      } catch (refreshErr) {
-        auth.logout()
-        window.location.href = '/login'
-        return Promise.reject(refreshErr)
-      }
+// --- 401 handling with a refresh queue ---
+// If several requests fail with 401 at the same time, we only want to
+// call /auth/refresh once. Everyone else waits on the same promise.
+let isRefreshing = false
+let refreshQueue = []
+
+function subscribeToRefresh(callback) {
+  refreshQueue.push(callback)
+}
+
+function onRefreshed(newAccessToken) {
+  refreshQueue.forEach((callback) => callback(newAccessToken))
+  refreshQueue = []
+}
+
+apiClient.interceptors.response.use(
+  (response) => response,
+  async (error) => {
+    const originalRequest = error.config
+    const status = error.response?.status
+
+    // Don't try to refresh on the refresh/login/register endpoints themselves.
+    const isAuthEndpoint = originalRequest?.url?.includes('/auth/refresh')
+      || originalRequest?.url?.includes('/auth/login')
+      || originalRequest?.url?.includes('/auth/register')
+
+    if (status !== 401 || isAuthEndpoint || originalRequest._retry) {
+      return Promise.reject(error)
     }
-    return Promise.reject(err)
+
+    const refreshToken = tokenStorage.getRefreshToken()
+    if (!refreshToken) {
+      tokenStorage.clear()
+      return Promise.reject(error)
+    }
+
+    originalRequest._retry = true
+
+    if (isRefreshing) {
+      // Wait for the in-flight refresh to finish, then retry with the new token.
+      return new Promise((resolve, reject) => {
+        subscribeToRefresh((newAccessToken) => {
+          if (!newAccessToken) {
+            reject(error)
+            return
+          }
+          originalRequest.headers.Authorization = `Bearer ${newAccessToken}`
+          resolve(apiClient(originalRequest))
+        })
+      })
+    }
+
+    isRefreshing = true
+    try {
+      const { data } = await axios.post(`${baseURL}/auth/refresh`, {
+        refresh_token: refreshToken,
+      })
+      tokenStorage.setAccessToken(data.access_token)
+      onRefreshed(data.access_token)
+      originalRequest.headers.Authorization = `Bearer ${data.access_token}`
+      return apiClient(originalRequest)
+    } catch (refreshError) {
+      onRefreshed(null)
+      tokenStorage.clear()
+      window.location.href = '/login'
+      return Promise.reject(refreshError)
+    } finally {
+      isRefreshing = false
+    }
   }
 )
-
-export default api
