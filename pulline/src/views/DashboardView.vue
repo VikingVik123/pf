@@ -39,17 +39,25 @@
 
       <!-- Content -->
       <main class="content">
-        <p v-if="loadError" class="load-error" role="alert">{{ loadError }}</p>
-
-        <div v-if="loadingProjects" class="grid">
-          <div v-for="n in 3" :key="n" class="card skeleton"></div>
+        <div v-if="needsVerification" class="verify-error">
+          <p class="verify-error-title">Email verification required</p>
+          <p class="verify-error-sub">{{ loadError }}</p>
+          <router-link to="/account" class="verify-error-link">Go to account settings →</router-link>
         </div>
 
-        <div v-else class="grid">
+        <template v-else>
+          <p v-if="loadError" class="load-error" role="alert">{{ loadError }}</p>
+
+          <div v-if="loadingProjects" class="grid">
+            <div v-for="n in 3" :key="n" class="card skeleton"></div>
+          </div>
+
+          <div v-else class="grid">
           <div v-for="project in projects" :key="project.id" class="card project-card">
             <router-link :to="`/projects/${project.id}`" class="project-card-link">
               <div class="card-top">
-                <span class="status-dot" :class="`status-${project.status}`"></span>
+                <span v-if="project.status === 'processing'" class="spinner" aria-hidden="true"></span>
+                <span v-else class="status-dot" :class="`status-${project.status}`"></span>
                 <span class="status-label">{{ statusLabel(project.status) }}</span>
               </div>
               <h3 class="project-name">{{ project.project_name || project.filename || 'Untitled project' }}</h3>
@@ -67,14 +75,21 @@
             </router-link>
 
             <button
-              v-if="project.status === 'pending'"
+              v-if="project.status === 'pending' && !processingIds[project.id]"
               type="button"
               class="process-btn"
-              :disabled="processingIds[project.id]"
               @click="handleProcess(project)"
             >
-              {{ processingIds[project.id] ? 'Starting…' : 'Process' }}
+              Process
             </button>
+
+            <div
+              v-else-if="processingIds[project.id] || project.status === 'processing'"
+              class="process-spinner"
+            >
+              <span class="spinner small" aria-hidden="true"></span>
+              <span>{{ processingIds[project.id] ? 'Starting…' : 'Processing…' }}</span>
+            </div>
           </div>
 
           <button type="button" class="card add-card" @click="showNewProjectModal = true">
@@ -82,6 +97,7 @@
             <span>New project</span>
           </button>
         </div>
+        </template>
       </main>
     </div>
 
@@ -94,7 +110,7 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { authApi } from '../api/auth'
 import { ifcApi } from '../api/ifc'
@@ -107,8 +123,12 @@ const user = ref(null)
 const projects = ref([])
 const loadingProjects = ref(true)
 const loadError = ref('')
+const needsVerification = ref(false)
 const showNewProjectModal = ref(false)
 const processingIds = reactive({})
+
+// Plain (non-reactive) map of setInterval handles, keyed by project id.
+const pollHandles = {}
 
 const userDisplayName = computed(() => user.value?.full_name || user.value?.username || '')
 const userInitial = computed(() => userDisplayName.value ? userDisplayName.value[0].toUpperCase() : '?')
@@ -135,15 +155,30 @@ function formatDate(isoString) {
 async function loadDashboard() {
   loadingProjects.value = true
   loadError.value = ''
+  needsVerification.value = false
+
   try {
-    const [userData, projectsData] = await Promise.all([
-      authApi.getCurrentUser(),
-      ifcApi.listProjects(),
-    ])
-    user.value = userData
-    projects.value = projectsData.projects
+    user.value = await authApi.getCurrentUser()
   } catch (err) {
     loadError.value = 'Could not load your dashboard. Please try refreshing.'
+    loadingProjects.value = false
+    return
+  }
+
+  try {
+    const projectsData = await ifcApi.listProjects()
+    projects.value = projectsData.projects
+    projects.value
+      .filter((p) => p.status === 'processing')
+      .forEach((p) => startPolling(p.id))
+  } catch (err) {
+    if (err.response?.status === 403) {
+      needsVerification.value = true
+      loadError.value =
+        err.response?.data?.detail || 'Please verify your email address to continue.'
+    } else {
+      loadError.value = 'Could not load your projects. Please try refreshing.'
+    }
   } finally {
     loadingProjects.value = false
   }
@@ -165,14 +200,57 @@ function handleProjectCreated(project) {
   projects.value = [project, ...projects.value]
 }
 
+function updateProjectStatus(projectId, patch) {
+  const idx = projects.value.findIndex((p) => p.id === projectId)
+  if (idx !== -1) {
+    projects.value[idx] = { ...projects.value[idx], ...patch }
+  }
+}
+
+function startPolling(projectId) {
+  if (pollHandles[projectId]) return
+  pollHandles[projectId] = setInterval(async () => {
+    try {
+      const status = await ifcApi.getProjectStatus(projectId)
+      updateProjectStatus(projectId, { status: status.status, progress: status.progress })
+
+      if (status.status === 'completed' || status.status === 'failed') {
+        stopPolling(projectId)
+        // Refetch the full project so floor/element counts reflect the finished result.
+        try {
+          const fresh = await ifcApi.getProject(projectId)
+          updateProjectStatus(projectId, {
+            total_floors: fresh.total_floors,
+            total_elements: fresh.total_elements,
+            processed_at: fresh.processed_at,
+          })
+        } catch {
+          // Non-fatal — status is already up to date even if this refetch fails.
+        }
+      }
+    } catch {
+      stopPolling(projectId)
+    }
+  }, 4000)
+}
+
+function stopPolling(projectId) {
+  if (pollHandles[projectId]) {
+    clearInterval(pollHandles[projectId])
+    delete pollHandles[projectId]
+  }
+}
+
+function stopAllPolling() {
+  Object.keys(pollHandles).forEach(stopPolling)
+}
+
 async function handleProcess(project) {
   processingIds[project.id] = true
   try {
     const result = await ifcApi.processProject(project.id)
-    const idx = projects.value.findIndex((p) => p.id === project.id)
-    if (idx !== -1) {
-      projects.value[idx] = { ...projects.value[idx], status: result.status }
-    }
+    updateProjectStatus(project.id, { status: result.status })
+    if (result.status === 'processing') startPolling(project.id)
   } catch (err) {
     loadError.value = 'Could not start processing that project. Please try again.'
   } finally {
@@ -181,6 +259,7 @@ async function handleProcess(project) {
 }
 
 onMounted(loadDashboard)
+onUnmounted(stopAllPolling)
 </script>
 
 <style scoped>
@@ -356,6 +435,40 @@ h1 {
   border-radius: 3px;
 }
 
+.verify-error {
+  padding: 28px 24px;
+  border: 1.5px solid #c2531a;
+  background: rgba(194, 83, 26, 0.06);
+  border-radius: 6px;
+  max-width: 480px;
+}
+
+.verify-error-title {
+  margin: 0 0 6px;
+  font-family: 'Space Grotesk', sans-serif;
+  font-weight: 600;
+  font-size: 16px;
+  color: #a3431a;
+}
+
+.verify-error-sub {
+  margin: 0 0 16px;
+  font-size: 13.5px;
+  color: #7a4326;
+  line-height: 1.5;
+}
+
+.verify-error-link {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: #0e2238;
+  text-decoration: none;
+}
+
+.verify-error-link:hover {
+  text-decoration: underline;
+}
+
 .grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
@@ -409,6 +522,10 @@ h1 {
 .process-btn {
   margin: 0 20px 16px;
   padding: 8px 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
   font-family: 'Space Grotesk', sans-serif;
   font-weight: 600;
   font-size: 13px;
@@ -427,6 +544,42 @@ h1 {
 .process-btn:disabled {
   opacity: 0.6;
   cursor: not-allowed;
+}
+
+.process-spinner {
+  margin: 0 20px 16px;
+  padding: 8px 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  font-family: 'Space Grotesk', sans-serif;
+  font-weight: 600;
+  font-size: 13px;
+  color: #7a8390;
+}
+
+.spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(47, 111, 168, 0.25);
+  border-top-color: #2f6fa8;
+  border-radius: 50%;
+  display: inline-block;
+  animation: spin 0.7s linear infinite;
+  flex-shrink: 0;
+}
+
+.spinner.small {
+  width: 12px;
+  height: 12px;
+  border-width: 1.5px;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .card-top {
@@ -544,6 +697,53 @@ h1 {
   }
   .content {
     padding: 24px 20px;
+  }
+}
+
+@media (max-width: 640px) {
+  .sidebar {
+    flex-wrap: wrap;
+    gap: 14px;
+    align-items: flex-start;
+  }
+
+  .wordmark {
+    margin-right: auto;
+  }
+
+  .nav {
+    width: 100%;
+    gap: 8px;
+  }
+
+  .nav-item {
+    justify-content: center;
+  }
+
+  .header {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 16px;
+  }
+
+  .user-chip {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .grid {
+    grid-template-columns: 1fr;
+  }
+
+  .project-meta {
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+
+  .process-btn,
+  .process-spinner {
+    margin-left: 16px;
+    margin-right: 16px;
   }
 }
 

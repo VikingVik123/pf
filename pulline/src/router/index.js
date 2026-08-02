@@ -30,6 +30,16 @@ const routes = [
     name: 'project-detail',
     component: () => import('../views/ProjectDetailView.vue'),
   },
+  {
+    path: '/verify-email',
+    name: 'verify-email',
+    component: () => import('../views/VerifyEmailView.vue'),
+  },
+  {
+    path: '/account',
+    name: 'account',
+    component: () => import('../views/AccountView.vue'),
+  },
 ]
 
 export const router = createRouter({
